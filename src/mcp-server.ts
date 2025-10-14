@@ -75,19 +75,22 @@ const updatePositionHierarchySchema = z.object({
     updateData: z.record(z.unknown()).describe("A JSON object with the fields to update (e.g., ParentPositionId)."),
 });
 //Added by JP Start
-const createSalesOrderSchema = z.object({
-  header: z.object({
-    dataAreaId: z.string().describe("Legal entity, e.g. 'usmf'."),
-    RequestedShippingDate: z.string().describe("ISO 8601 date, e.g. '2025-10-20'."),
-    CustomerAccount: z.string().describe("Customer account, e.g. 'US-001'."),
-    SalesOrderNumber: z.string().optional().describe("Optional. If omitted, D365 auto-assigns.")
-  }),
+const createSalesOrderHeaderSchema = z.object({
+  dataAreaId: z.string().describe("Legal entity, e.g. 'usmf'."),
+  RequestedShippingDate: z.string().describe("ISO 8601 date, e.g. '2025-10-20'."),
+  CustomerAccount: z.string().describe("Customer account, e.g. 'US-001'."),
+  SalesOrderNumber: z.string().optional().describe("Optional. If omitted, D365 auto-assigns.")
+});
+
+const addSalesOrderLinesSchema = z.object({
+  dataAreaId: z.string().describe("Legal entity, e.g. 'usmf'."),
+  SalesOrderNumber: z.string().describe("The sales order number to add lines to."),
   lines: z.array(z.object({
-    ItemNumber: z.string().describe("Item number to add as a line."),
+    ItemNumber: z.string().describe("Item number."),
     // Accept 5 or "5"
-    OrderedSalesQuantity: z.coerce.number().describe("Ordered quantity for the line."),
-    SiteId: z.string().optional().describe("Optional. If omitted, system defaulting may fill it.")
-  })).min(1).describe("At least one line.")
+    OrderedSalesQuantity: z.coerce.number().describe("Ordered quantity."),
+    SiteId: z.string().optional().describe("Optional site; system may default if omitted.")
+  })).min(1).describe("One or more lines.")
 });
 
 //Added by JP End
@@ -255,106 +258,106 @@ export const getServer = (): McpServer => {
         }
     );
 //Added by JP Start 
+// --- Create Sales Order Header ---
 server.tool(
-  'createSalesOrder',
-  'Creates a sales order header (SalesOrderHeadersV4) and one or more lines (SalesOrderLinesV3). SalesOrderNumber and SiteId are optional.',
-  createSalesOrderSchema.shape,
-  async ({ header, lines }: z.infer<typeof createSalesOrderSchema>, context) => {
-    const callAndGetText = async (
-      method: 'GET' | 'POST' | 'PATCH',
-      url: string,
-      body: Record<string, unknown> | null
-    ) => {
-      const res = await makeApiCall(method, url, body, async (n) => { await safeNotification(context, n); });
+  'createSalesOrderHeader',
+  'Creates a sales order header in SalesOrderHeadersV4. Omit SalesOrderNumber to auto-assign.',
+  createSalesOrderHeaderSchema.shape,
+  async (args: z.infer<typeof createSalesOrderHeaderSchema>, context) => {
+    const payload: Record<string, unknown> = {
+      dataAreaId: args.dataAreaId,
+      RequestedShippingDate: args.RequestedShippingDate,
+      CustomerAccount: args.CustomerAccount,
+      ...(args.SalesOrderNumber ? { SalesOrderNumber: args.SalesOrderNumber } : {})
+    };
+
+    await safeNotification(context, {
+      method: "notifications/message",
+      params: { level: "info", data: `Creating sales order header${args.SalesOrderNumber ? `: ${args.SalesOrderNumber}` : ''}` }
+    });
+
+    const url = `${process.env.DYNAMICS_RESOURCE_URL}/data/SalesOrderHeadersV4`;
+    const result = await makeApiCall('POST', url, payload, async (n) => { await safeNotification(context, n); });
+
+    // Try to surface the assigned number (if auto)
+    let assigned: string | undefined;
+    const txt = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
+    try {
+      const obj = JSON.parse(txt);
+      assigned = obj?.SalesOrderNumber ?? obj?.SalesId ?? args.SalesOrderNumber;
+    } catch { /* ignore */ }
+
+    return {
+      ...(result.isError ? { isError: true } : {}),
+      content: [{
+        type: 'text',
+        text: assigned
+          ? `Header created. SalesOrderNumber: ${assigned}\n\nRaw response:\n${txt}`
+          : (txt || 'Header created.')
+      }]
+    };
+  }
+);
+
+// --- Add Sales Order Lines (one or many) ---
+server.tool(
+  'addSalesOrderLines',
+  'Adds one or more lines to an existing order in SalesOrderLinesV3.',
+  addSalesOrderLinesSchema.shape,
+  async (args: z.infer<typeof addSalesOrderLinesSchema>, context) => {
+    await safeNotification(context, {
+      method: "notifications/message",
+      params: { level: "info", data: `Adding ${args.lines.length} line(s) to order ${args.SalesOrderNumber}` }
+    });
+
+    const url = `${process.env.DYNAMICS_RESOURCE_URL}/data/SalesOrderLinesV3`;
+    const perLine: Array<{ index: number; ok: boolean; message: string }> = [];
+
+    // Helper to call and unwrap text
+    const call = async (body: Record<string, unknown>) => {
+      const res = await makeApiCall('POST', url, body, async (n) => { await safeNotification(context, n); });
       const first = res.content?.[0];
       const text = (first && first.type === 'text') ? first.text : JSON.stringify(res);
       return { res, text };
     };
 
-    // 1) Create header (omit SalesOrderNumber if not provided)
-    const headerPayload: Record<string, unknown> = {
-      dataAreaId: header.dataAreaId,
-      RequestedShippingDate: header.RequestedShippingDate,
-      CustomerAccount: header.CustomerAccount,
-      ...(header.SalesOrderNumber ? { SalesOrderNumber: header.SalesOrderNumber } : {})
-    };
-
-    await safeNotification(context, {
-      method: "notifications/message",
-      params: { level: "info", data: `Creating sales order header${header.SalesOrderNumber ? `: ${header.SalesOrderNumber}` : ''}` }
-    });
-
-    const headerUrl = `${process.env.DYNAMICS_RESOURCE_URL}/data/SalesOrderHeadersV4`;
-    const { res: headerRes, text: headerText } = await callAndGetText('POST', headerUrl, headerPayload);
-
-    if ((headerRes as any).isError) {
-      return { isError: true, content: [{ type: 'text', text: `Failed to create Sales Order header.\n\n${headerText}` }] };
-    }
-
-    // 2) Extract the auto-assigned SalesOrderNumber from the header response
-    let assignedOrderNumber: string | undefined = header.SalesOrderNumber;
-    try {
-      const parsed = JSON.parse(headerText);
-      // D365 usually echoes the created entity; try the common property names
-      assignedOrderNumber = parsed?.SalesOrderNumber ?? parsed?.SalesId ?? assignedOrderNumber;
-    } catch {
-      // If the response wasn't JSON, leave assignedOrderNumber as-is
-    }
-
-    if (!assignedOrderNumber) {
-      // If we still don't have it, stop now to avoid creating orphaned lines
-      return {
-        isError: true,
-        content: [{ type: 'text', text: `Header created but SalesOrderNumber was not returned. Cannot create lines without an order number.\nResponse:\n${headerText}` }]
-      };
-    }
-
-    await safeNotification(context, {
-      method: "notifications/message",
-      params: { level: "info", data: `Header created. Order number: ${assignedOrderNumber}. Creating ${lines.length} line(s)...` }
-    });
-
-    // 3) Create lines using the assigned order number
-    const lineUrl = `${process.env.DYNAMICS_RESOURCE_URL}/data/SalesOrderLinesV3`;
-    const perLineResults: Array<{ index: number; ok: boolean; message: string }> = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const linePayload: Record<string, unknown> = {
-        dataAreaId: header.dataAreaId,
-        SalesOrderNumber: assignedOrderNumber,   // <- crucial
-        ItemNumber: line.ItemNumber,
-        OrderedSalesQuantity: line.OrderedSalesQuantity,
-        ...(line.SiteId ? { SiteId: line.SiteId } : {})
+    for (let i = 0; i < args.lines.length; i++) {
+      const ln = args.lines[i];
+      const payload: Record<string, unknown> = {
+        dataAreaId: args.dataAreaId,
+        SalesOrderNumber: args.SalesOrderNumber,
+        ItemNumber: ln.ItemNumber,
+        OrderedSalesQuantity: ln.OrderedSalesQuantity,
+        ...(ln.SiteId ? { SiteId: ln.SiteId } : {})
       };
 
-      const { res, text } = await callAndGetText('POST', lineUrl, linePayload);
+      const { res, text } = await call(payload);
       const ok = !(res as any).isError;
-      perLineResults.push({
-        index: i,
-        ok,
-        message: ok ? `Line ${i + 1} created.` : `Line ${i + 1} failed.\n${text}`
-      });
+      perLine.push({ index: i, ok, message: ok ? `Line ${i + 1} created.` : `Line ${i + 1} failed.\n${text}` });
 
       await safeNotification(context, {
         method: "notifications/message",
-        params: { level: ok ? "info" : "error", data: perLineResults[perLineResults.length - 1].message }
+        params: { level: ok ? "info" : "error", data: perLine[perLine.length - 1].message }
       });
     }
 
-    // 4) Summarize
-    const summary = {
-      header: { SalesOrderNumber: assignedOrderNumber, created: true },
-      lines: perLineResults
+    return {
+      content: [{
+        type: 'text',
+        text: `Add lines summary:\n\n${JSON.stringify({
+          order: args.SalesOrderNumber,
+          lines: perLine
+        }, null, 2)}`
+      }]
     };
-
-    return { content: [{ type: 'text', text: `Sales order creation summary:\n\n${JSON.stringify(summary, null, 2)}` }] };
   }
 );
+
 
 //Added by JP End
 
     return server;
 
 };
+
 
